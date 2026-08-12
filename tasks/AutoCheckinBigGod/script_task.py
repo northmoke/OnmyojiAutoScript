@@ -37,6 +37,7 @@ GL_PACKAGE = "com.netease.gl"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 FRIDA_SERVER_LOCAL = os.path.join(SCRIPT_DIR, "frida-server-17.6.2-android-x86_64")
 FRIDA_SERVER_REMOTE = "/data/local/tmp/frida-server"
+FRIDA_SERVER_LOG = "/data/local/tmp/frida-server.log"
 
 APP_KEY = "g37"
 GL_VERSION = "4.12.0"  # 默认值，运行时会从APP动态获取
@@ -58,6 +59,7 @@ class ScriptTask(BaseTask):
         self.frida_pid = None
         self._frida_session = None  # 常驻 frida.exe 子进程
         self._frida_attached_pid = None  # REPL 当前 attach 的 PID
+        self._frida_root_mode = None
 
         self.session = requests.Session()
         self.session.verify = False
@@ -174,24 +176,75 @@ class ScriptTask(BaseTask):
         except Exception:
             pass
         try:
-            self._adb_shell(['su -c "killall frida-server"'])
+            self._adb_root_shell('killall frida-server')
         except Exception:
             pass
 
     # ======================== ADB 操作 ========================
 
-    def _adb_cmd(self, args, timeout=10):
+    def _adb_cmd_result(self, args, timeout=10):
         # 如果有设备序列号且命令不是 connect/devices，则添加 -s 参数指定设备
         cmd = [ADB_PATH]
         if hasattr(self, '_adb_serial') and self._adb_serial and args[0] not in ['connect', 'devices']:
             cmd.extend(['-s', self._adb_serial])
         cmd.extend(args)
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                                creationflags=_NO_WINDOW)
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                              creationflags=_NO_WINDOW)
+
+    def _adb_cmd(self, args, timeout=10):
+        result = self._adb_cmd_result(args, timeout=timeout)
         return result.stdout.strip()
 
     def _adb_shell(self, cmd, timeout=15):
         return self._adb_cmd(['shell'] + cmd, timeout=timeout)
+
+    def _ensure_root_access(self):
+        """返回 Root 命令执行方式：adb 表示 adbd 已是 root，su 表示通过 su 执行。"""
+        root_mode = getattr(self, '_frida_root_mode', None)
+        if root_mode:
+            return root_mode
+
+        if 'uid=0(' in self._adb_shell(['id']):
+            self._frida_root_mode = 'adb'
+            return self._frida_root_mode
+
+        # 优先使用模拟器提供的 su，避免不必要地重启 adbd。
+        if 'uid=0(' in self._adb_shell(['su', '-c', 'id']):
+            self._frida_root_mode = 'su'
+            return self._frida_root_mode
+
+        logger.info('su不可用，尝试通过adb root获取Root权限...')
+        try:
+            result = self._adb_cmd_result(['root'], timeout=10)
+        except Exception as e:
+            logger.error(f'adb root执行失败: {e}')
+            return None
+
+        root_message = '\n'.join(
+            part.strip() for part in (result.stdout, result.stderr) if part.strip()
+        )
+        # adb root 会重启 adbd，需要等待设备重新上线。
+        for _ in range(10):
+            time.sleep(0.5)
+            try:
+                if 'uid=0(' in self._adb_shell(['id'], timeout=3):
+                    self._frida_root_mode = 'adb'
+                    logger.info('adb root已生效')
+                    return self._frida_root_mode
+            except (subprocess.TimeoutExpired, OSError):
+                continue
+
+        detail = root_message or '设备未以root身份重新上线'
+        logger.error(f'无法获取Root权限: {detail}')
+        return None
+
+    def _adb_root_shell(self, command, timeout=15):
+        root_mode = self._ensure_root_access()
+        if root_mode == 'adb':
+            return self._adb_shell([command], timeout=timeout)
+        if root_mode == 'su':
+            return self._adb_shell(['su', '-c', command], timeout=timeout)
+        raise RuntimeError('模拟器未提供Root权限')
 
     def _get_app_pid(self):
         try:
@@ -211,17 +264,14 @@ class ScriptTask(BaseTask):
                 logger.info('大神APP已在运行，无需重启')
                 return pid
 
-            # 优先通过 ContentProvider 后台启动（不显示UI，需要 su 权限）
             logger.info('后台启动大神APP进程...')
-            try:
-                subprocess.run(
-                    [ADB_PATH] + (['-s', self._adb_serial] if getattr(self, '_adb_serial', None) else []) +
-                    ['shell', 'su', '0', 'content', 'query', '--uri',
-                     f'content://{GL_PACKAGE}.utilcode.provider/'],
-                    capture_output=True, timeout=20, creationflags=_NO_WINDOW
-                )
-            except subprocess.TimeoutExpired:
-                pass
+
+            self._adb_shell([
+                'am',
+                'start',
+                '-n',
+                'com.netease.gl/.ui.activity.welcome.WelcomeInitActivity'
+            ])
 
             # 等待进程启动
             for _ in range(10):
@@ -300,18 +350,23 @@ class ScriptTask(BaseTask):
 
     def _is_frida_server_running(self):
         try:
-            output = self._adb_shell(['ps | grep frida-server'])
-            if output == '' or 'frida-server' not in output:
+            output = self._adb_shell(['pidof', 'frida-server'])
+            pids = [value for value in output.split() if value.isdigit()]
+            if not pids:
                 return False
-            # 确保是以 root 身份运行，否则无法 attach 进程
-            for line in output.strip().split('\n'):
-                if 'frida-server' in line and 'grep' not in line:
-                    if line.strip().startswith('root'):
+
+            # /proc 的实际 UID 不受各 Android 版本 ps 输出格式差异影响。
+            for pid in pids:
+                status = self._adb_shell([f'cat /proc/{pid}/status'])
+                for line in status.splitlines():
+                    fields = line.split()
+                    if len(fields) > 1 and fields[0] == 'Uid:' and fields[1] == '0':
                         return True
+
             # frida-server 存在但不是 root 运行，杀掉重启
             logger.warning('Frida Server未以root运行，正在重启...')
             try:
-                self._adb_shell(['su -c "killall frida-server"'])
+                self._adb_root_shell('killall frida-server')
             except Exception:
                 pass
             return False
@@ -349,9 +404,9 @@ class ScriptTask(BaseTask):
         try:
             # 先删除旧文件（如果存在）
             try:
-                self._adb_shell([f'su -c "rm -f {FRIDA_SERVER_REMOTE}"'])
-            except:
-                pass
+                self._adb_root_shell(f'rm -f {FRIDA_SERVER_REMOTE}')
+            except Exception:
+                self._adb_shell(['rm', '-f', FRIDA_SERVER_REMOTE])
 
             # 推送文件
             self._adb_cmd(['push', FRIDA_SERVER_LOCAL, FRIDA_SERVER_REMOTE], timeout=60)
@@ -387,23 +442,35 @@ class ScriptTask(BaseTask):
 
     def _start_frida_server(self):
         logger.info('启动Frida Server...')
-        # 使用 su + nohup 以 root 身份后台启动，否则无权 attach 其他进程
-        # 将 stdout/stderr 重定向到 /dev/null 避免阻塞
-        start_cmd = f'su -c "nohup {FRIDA_SERVER_REMOTE} > /dev/null 2>&1 &"'
+        root_mode = self._ensure_root_access()
+        if not root_mode:
+            logger.error('Frida Server需要Root权限，但su和adb root均不可用')
+            return False
+
+        # 保留启动日志，失败时可区分架构不匹配、权限或端口占用。
+        start_cmd = (
+            f'rm -f {FRIDA_SERVER_LOG}; '
+            f'nohup {FRIDA_SERVER_REMOTE} >{FRIDA_SERVER_LOG} 2>&1 </dev/null &'
+        )
         try:
-            self._adb_shell([start_cmd], timeout=5)
+            self._adb_root_shell(start_cmd, timeout=5)
         except subprocess.TimeoutExpired:
-            # su 启动可能超时，但进程已经在后台运行了
+            # 后台启动可能超时，但进程可能已正常运行。
             pass
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f'Frida Server启动命令执行失败: {e}')
+            return False
         # 轮询检测启动状态，最多等10秒
         for _ in range(5):
             time.sleep(2)
             if self._is_frida_server_running():
                 logger.info('Frida Server已启动')
                 return True
-        logger.error('Frida Server启动失败，请确保模拟器已开启Root模式')
+
+        start_log = self._adb_shell(['cat', FRIDA_SERVER_LOG])
+        if start_log:
+            logger.error(f'Frida Server启动输出: {start_log[:500]}')
+        logger.error('Frida Server启动失败，请检查上述Root或启动输出')
         return False
 
     def _ensure_frida_server_running(self):
@@ -649,11 +716,6 @@ class ScriptTask(BaseTask):
         """通过 Frida 从内存中提取 GL 认证信息（UID/Token/DeviceId/Source）"""
         script = """
 Java.perform(function() {
-    try {
-        var YXFDeviceInfo = Java.use('com.netease.gl.glbase.build.YXFDeviceInfo');
-        console.log('GL_DEVICEID:' + YXFDeviceInfo.getDeviceId());
-    } catch(e) {}
-
     Java.choose('com.netease.gl.serviceaccount.proto.auth.GLAuth$Authed', {
         onMatch: function(instance) {
             var uid = instance.getUid();
@@ -688,6 +750,9 @@ Java.perform(function() {
                 data['GL_SOURCE'] = line.split('GL_SOURCE:')[1].strip()
 
         if data.get('GL_UID') and data.get('GL_TOKEN'):
+            device_id = self._get_device_id(pid)
+            if device_id:
+                data['GL_DEVICEID'] = device_id
             # 版本号通过 ADB 获取
             version = self._get_app_version()
             if version:
@@ -765,22 +830,111 @@ Java.perform(function() {{
     def _get_urs_credentials(self, pid):
         """通过 ADB 直接从 auth 数据库读取 URS 凭据（不需要 Frida）"""
         try:
-            # 直接通过 ADB + su + sqlite3 读取 auth 数据库
+            # Frida 启动阶段已确立 Root 通道，兼容 su 和 adb root 模拟器。
             sql = 'SELECT uid, token, account, ursAuthedToken, ursAuhtedId, authType FROM userauths LIMIT 1'
             db_path = f'/data/data/{GL_PACKAGE}/databases/auth'
-            # 用单条字符串传给 adb shell，避免参数拆分导致 SQL 断裂
-            shell_cmd = f'su 0 sqlite3 {db_path} "{sql}"'
-            result = subprocess.run(
-                [ADB_PATH] + (['-s', self._adb_serial] if getattr(self, '_adb_serial', None) else []) +
-                ['shell', shell_cmd],
-                capture_output=True, text=True, timeout=10, creationflags=_NO_WINDOW
+            # Android模拟器没有sqlite3命令，改为pull数据库到Mac本地读取
+            import tempfile
+            import sqlite3
+
+            local_db = os.path.join(
+                tempfile.gettempdir(),
+                'god_auth.db'
             )
-            row = result.stdout.strip()
-            if not row or '|' not in row:
-                logger.warning('auth数据库为空或不可读')
+
+            remote_tmp = '/data/local/tmp/auth'
+
+            # 同时复制 SQLite 主库、WAL 和 SHM，避免只拉到4KB空壳数据库
+            self._adb_shell([
+                'su',
+                '-c',
+                f'rm -f {remote_tmp} {remote_tmp}-wal {remote_tmp}-shm'
+            ], timeout=10)
+
+            self._adb_shell([
+                'su',
+                '-c',
+                f'cp {db_path} {remote_tmp} && '
+                f'cp {db_path}-wal {remote_tmp}-wal && '
+                f'cp {db_path}-shm {remote_tmp}-shm'
+            ], timeout=10)
+
+            subprocess.run(
+                [
+                    'adb',
+                    '-s',
+                    self._adb_serial,
+                    'pull',
+                    remote_tmp,
+                    local_db
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=10
+            )
+
+            subprocess.run(
+                [
+                    'adb',
+                    '-s',
+                    self._adb_serial,
+                    'pull',
+                    f'{remote_tmp}-wal',
+                    f'{local_db}-wal'
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=10
+            )
+
+            subprocess.run(
+                [
+                    'adb',
+                    '-s',
+                    self._adb_serial,
+                    'pull',
+                    f'{remote_tmp}-shm',
+                    f'{local_db}-shm'
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=10
+            )
+
+            if not os.path.exists(local_db):
+                logger.warning('无法拉取auth数据库')
                 return None
 
-            fields = row.split('|')
+            try:
+                conn = sqlite3.connect(local_db)
+
+
+                cursor = conn.execute(
+                    'SELECT uid, token, account, ursAuthedToken, ursAuhtedId, authType FROM userauths LIMIT 1'
+                )
+
+                row_data = cursor.fetchone()
+
+                conn.close()
+
+                if not row_data:
+                    logger.warning('auth数据库为空')
+                    return None
+
+                fields = list(row_data)
+                data = {
+                    'AUTH_UID': fields[0],
+                    'AUTH_TOKEN': fields[1],
+                    'AUTH_ACCOUNT': fields[2],
+                    'AUTH_URS_TOKEN': fields[3],
+                    'AUTH_URS_ID': fields[4],
+                    'AUTH_TYPE': fields[5],
+                }
+
+            except Exception as e:
+                logger.warning(f'读取auth数据库失败: {e}')
+                return None
+
             if len(fields) < 6:
                 logger.warning(f'auth数据库字段不足: {len(fields)}')
                 return None
@@ -836,8 +990,21 @@ Java.perform(function() {{
         script = """
 Java.perform(function() {
     try {
-        var YXFDeviceInfo = Java.use('com.netease.gl.glbase.build.YXFDeviceInfo');
-        var id = YXFDeviceInfo.getDeviceId();
+        var className = 'com.netease.gl.glbase.build.YXFDeviceInfo';
+        var YXFDeviceInfo = null;
+        try {
+            YXFDeviceInfo = Java.use(className);
+        } catch(e) {
+            var loaders = Java.enumerateClassLoadersSync();
+            for (var i = 0; i < loaders.length; i++) {
+                try {
+                    loaders[i].loadClass(className);
+                    YXFDeviceInfo = Java.ClassFactory.get(loaders[i]).use(className);
+                    break;
+                } catch(loaderError) {}
+            }
+        }
+        var id = YXFDeviceInfo ? YXFDeviceInfo.getDeviceId() : '';
         if (id && typeof id === 'string' && id != 'unknown') console.log('GL_DEVICEID:' + id);
     } catch(e) {}
     try {
@@ -950,11 +1117,89 @@ Java.perform(function() {
         payload = {"uid": self.gl_uid}
 
         try:
-            resp = self.session.post(url, json=payload, headers=self._build_headers(), timeout=15)
+            resp = self.session.post(
+                url,
+                json=payload,
+                headers=self._build_headers(),
+                timeout=15
+            )
             data = resp.json()
-            if data.get('code') != 200:
-                logger.warning(f'获取角色信息失败: {data.get("errmsg")}')
+
+            code = data.get('code')
+            msg = data.get('errmsg', '')
+
+            # Token失效，尝试重新获取Token后再请求一次
+            if code != 200 and self._is_token_expired(code, msg):
+                logger.warning(f'角色信息请求提示Token失效: {msg}')
+                logger.info('尝试重新获取Token...')
+
+                pid = self.frida_pid or self._get_app_pid()
+
+                if pid:
+                    # 从当前APP内存重新提取Token
+                    token_data = self._try_extract_token(pid)
+
+                    if token_data:
+                        self.gl_uid = token_data.get('GL_UID', '')
+                        self.gl_token = token_data.get('GL_TOKEN', '')
+                        self.gl_deviceid = token_data.get(
+                            'GL_DEVICEID',
+                            self.gl_deviceid
+                        )
+                        self.gl_source = token_data.get(
+                            'GL_SOURCE',
+                            'URS'
+                        )
+
+                        logger.info('重新获取Token成功，重试角色信息...')
+
+                        # Token更新后必须重新生成payload
+                        payload = {"uid": self.gl_uid}
+
+                        resp = self.session.post(
+                            url,
+                            json=payload,
+                            headers=self._build_headers(),
+                            timeout=15
+                        )
+                        data = resp.json()
+
+                        code = data.get('code')
+                        msg = data.get('errmsg', '')
+
+            if code != 200:
+                logger.warning(f'获取角色信息失败: {msg}')
                 return None
+
+            roles = data.get('result', [])
+
+            for role in roles:
+                if role.get('appKey') == self.app_key:
+                    role_id = role.get('roleId', '')
+                    server = role.get('server', '')
+
+                    if role_id:
+                        logger.info(
+                            f'API获取角色成功: {role_id} @ {server}'
+                        )
+                        return {
+                            'roleId': role_id,
+                            'server': server
+                        }
+
+            if roles:
+                logger.warning(
+                    f'找到 {len(roles)} 个绑定角色，'
+                    f'但无 appKey={self.app_key} 的角色'
+                )
+            else:
+                logger.warning('未找到任何绑定角色')
+
+            return None
+
+        except Exception as e:
+            logger.warning(f'获取角色信息异常: {e}')
+            return None
 
             roles = data.get('result', [])
             for role in roles:
